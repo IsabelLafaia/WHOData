@@ -75,6 +75,85 @@ gc()
 
 ```{r readICDdata, echo=TRUE}
 library(xml2)
+library(tidyr)
+library(dplyr)
+library(XML)
+library(rvest)
+
+# Getting icd10 codes from the website www.wolfbane.com
+# 1st URL: 4-digit codes
+# 2nd URL: letter-plus-2or3digit codes
+URL <- c('http://www.wolfbane.com/icd/icd10a1.htm', 
+        'http://www.wolfbane.com/icd/icd10h.htm')
+
+
+for(i in 1:length(URL)){
+	# Get the data from each URL as a vector of strings 
+	# (each vector element is a text line in the URL)
+	aux <- read_html(URL[i]) %>% 
+  		html_node("pre") %>% 
+	  	html_text() %>% 
+  		strsplit("\n",fixed = TRUE)
+
+	# Tranform the vector into a list, to facilitate the processing
+	aux <- aux[[1]][ 3:length(aux[[1]]) ]	# The first two lines are empty
+	attr(aux, "dim") <- c(length(aux),1)	# Transform into matrix
+	colnames(aux) <- "text"				# Transform into list
+
+	# Collect the data from the different URL's into a single object raw_icd10
+	if(exists("raw_icd10")){
+		raw_icd10 <- rbind(raw_icd10, aux)
+	} else{
+		raw_icd10 <- aux
+	}
+}
+
+
+# The object raw_icd10 requires some processing in order to 
+# extract the codes and descriptions for each disease in a 
+# format that can be later compared to the records of mortality.
+
+# 1) separate...: split each text line into a code and a description. Split at digit-plus-space or digit-parenthesis-space.
+# 2) filter...: remove lines that contain text only.
+# 3) mutate...: remove spaces that may still remain around the codes and descriptions.
+# 4) separate...: this is required for condensed-list codes which have the range of specific codes at the right of the description (see http://www.wolfbane.com/icd/icd10a1.htm).
+# 5) select...: we do not need the range of specific codes for each condensed-list code.
+# 6) mutate+gsub: eliminate dots and dashes in the codes.
+
+icd10 <- as_tibble(raw_icd10) %>%
+	separate(text, into = c("Code", "Cause"), sep = "(?<=[:digit:] )|(?<=[:digit:]\\) )", extra = "merge") %>% 
+	mutate(Code = str_trim(Code, side = "both"), Cause = str_trim(Cause, side = "both")) %>%
+	separate(Cause, into = c("Cause", "Other"), sep = "(  )", extra = "merge") %>%
+	select(-Other) %>%
+	mutate(Code = gsub(".", "", Code, fixed = TRUE)) %>%
+	mutate(Code = gsub("-", "", Code, fixed = TRUE))
+
+
+# 4-character codes: these codes are specific cases of 3-character codes. For example:
+# C15   Malignant neoplasm of oesophagus	(3-char code)
+# C15.0       Cervical part of oesophagus (4-char code)
+# C15.1       Thoracic part of oesophagus (4-char code)
+# ...
+# As observed in this example, the 4-char codes don't always have a complete description of the disease.
+# To make each record in icd10 self-sufficient, the description in the 3-char code will be replicated to each of its 4-char codes as well.
+
+for(i in 1:nrow(icd10)){
+	# If 4 characters (1 letter plus 3 digits)
+	if(str_detect(icd10$Code[i],"[:alpha:][:digit:][:digit:][:digit:]")){
+		# Add more general description at the start of Cause
+		other = icd10$Cause[icd10$Code == substr(icd10$Code[i],1,3)] # Get the description of the corresponding 3-char code
+		icd10$Cause[i] = paste(other,icd10$Cause[i], sep=" - ")	 # Paste the general description at the start of each 4-char record.
+	}
+}
+
+# Important notes:
+# 1) codes starting with CH and UE (Portugal) are still not included in icd10.
+# 2) the following codes in the mortality dataset cannot be found in icd10 
+# (31 out of 10660 different codes in the mortality database, not counting the codes CH and UE):
+# "1000" "AAA"  "C809" "F700" "F701" "F708" "F709" "F710" "F711" "F719" 
+# "F720" "F721" "F728" "F729" "F730" "F731" "F738" "F739" "F780" "F781" 
+# "F788" "F789" "F790" "F791" "F798" "F799" "I272" "K859" "L899" "M726" "Q315"
+# 3) this treatment of the codes is valid only for the icd10 codes. Other codes (icd7, icd8 and icd9) require a different treatment because their format varies substantially.
 
 ```
 
@@ -87,8 +166,19 @@ library(xml2)
 
 ```{r keepNeoplasm, echo=TRUE}
 library(dplyr)
+library(tidyr)
 
+# First, I'll change the names of columns Deaths... . It is much easier to do this now than after turning these columns into a new feature. Also this will allow later merging with the population dataset.
+morticd10_long <- morticd10_part1
+colnames(morticd10_long) <- str_replace(colnames(morticd10_long),"Deaths","")
 
+# Step 1: remove unnecessary columns Admin1, SubDiv, IM_Frmat, IM_Age1,...,IM_Age4 (note thate IM_Deaths... were changed to IM_... by the previous command).
+# Step 2: transform to long format: age groups are not variables, but different values of the variable age. 
+morticd10_long <- morticd10_long %>%
+        select(-Admin1,-SubDiv,-IM_Frmat,-(IM_1:IM_4)) %>%
+        gather("AgeGroup", "Deaths", (`1`:`26`)) 
+
+rm(morticd10_part1)
 ```
 
 
@@ -98,6 +188,17 @@ library(dplyr)
 
 ```{r popLong, echo=TRUE}
 
+# First, I'll change the names of columns Pop... . It is much easier to do this now than after turning these columns into a new feature. Also this will allow later merging with the mortality dataset.
+pop_long <- pop
+colnames(pop_long) <- str_replace(colnames(pop_long),"Pop","")
+
+# Step 1: remove unnecessary columns Admin1, SubDiv, Lb.
+# Step 2: transform to long format: age groups are not variables, but different values of the variable age.
+pop_long <- pop_long   %>%
+        select(-Admin1, -SubDiv, -Lb) %>%
+        gather("AgeGroup", "Population", `1`:`26`)
+
+rm(pop)
 ```
 
 
@@ -111,6 +212,18 @@ library(dplyr)
 
 ```{r mortalityPop, echo=TRUE}
 
+mortality_pop <- morticd10_long %>%
+        	left_join(pop_long, 
+		by = c("Country"="Country", 
+			"Year"="Year", 
+			"Sex"="Sex", 
+			"Frmat"="Frmat", 
+			"AgeGroup" = "AgeGroup" )) 
+
+# Note 1: it seems like the dataset pop_long does not contain info for certain years and certain countries.
+# Note 2: the pop dataset is intended to allow calculating death rates. In that case, does it make sense to keep the population for each age group or should we just keep the population for each set (country, sex, year)?
+# Note 3: the mortality database contains entries with NA deaths. It is important to clean both the mortality and the population datasets before merging.
+# Note 4: beware that this merging can slow down the computer. The problem is that both morticd10_long and mortality_pop take a big portion of RAM.
 ```
 
 
